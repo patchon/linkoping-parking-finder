@@ -7,8 +7,6 @@ from __future__ import annotations
 
 import contextlib
 from enum import StrEnum
-
-# Setup browser context
 import functools
 import json
 import logging
@@ -18,7 +16,9 @@ import re
 import signal
 import sys
 import time
-from typing import TYPE_CHECKING, ClassVar, Never
+
+# Setup browser context
+from typing import TYPE_CHECKING, Callable, ClassVar, Never
 
 from playwright.sync_api import (
     Browser,
@@ -610,17 +610,17 @@ def notify_whatsapp(message: str) -> None:
     logger.info("sending whatsapp notification")
     try:
         client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-        messages: MessageList = client.messages  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
-        message_instance: MessageInstance = messages.create(  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
+        messages: MessageList = client.messages
+        message_instance: MessageInstance = messages.create(
             body=message,
             from_=WHATSAPP_FROM,
             to=WHATSAPP_TO,
         )
-        if message_instance.status in ["queued", "sending", "sent", "delivered"]:  # pyright: ignore[reportUnknownMemberType]
+        if message_instance.status in ["queued", "sending", "sent", "delivered"]:
             logger.debug(
                 "whatsapp notification sent successfully, message sid: %s, status: %s",
-                message_instance.sid,  # pyright: ignore[reportUnknownArgumentType, reportUnknownMemberType]
-                message_instance.status,  # pyright: ignore[reportUnknownArgumentType, reportUnknownMemberType]
+                message_instance.sid,
+                message_instance.status,
             )
         else:
             logger.error(
@@ -628,10 +628,10 @@ def notify_whatsapp(message: str) -> None:
                     "whatsapp notification failed, message sid: %s, status: %s, error"
                     "code '%s', error message '%s'"
                 ),
-                message_instance.sid,  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType]
-                message_instance.status,  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType]
-                message_instance.error_code,  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType]
-                message_instance.error_message,  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType]
+                message_instance.sid,
+                message_instance.status,
+                message_instance.error_code,
+                message_instance.error_message,
             )
     except TwilioRestException:
         logger.exception("failure when sending whatsapp notification: ")
@@ -1146,15 +1146,11 @@ def is_logging_enabled() -> bool:
     return logging.getLogger().isEnabledFor(logging.CRITICAL)
 
 
-# class BrowserHolder:
-#    browser: Browser | None = None
-
-
-def sig_handler(
+def sig_handler_yaspin(
     _signum: int,
     _frame: FrameType,
     spinner: Yaspin,
-    browser_holder: BrowserHolder,
+    browser: Browser | None,
 ) -> None:
     """Custom signal handler for SIGINT.
 
@@ -1162,29 +1158,97 @@ def sig_handler(
         _signum (int): Signal number.
         _frame (FrameType): Current stack frame.
         spinner (Yaspin): Spinner instance.
-        browser_holder (BrowserHolder): Holds the browser instance.
+        browser (Browser): Holds the browser instance.
     """
-    if isinstance(browser_holder.browser, Browser):
-        browser_holder.browser.close()
+    if isinstance(browser, Browser):
+        browser.close()
     spinner.red.fail("-> received SIGINT ")
     spinner.stop()
     sys.exit(1)
 
 
-class BrowserHolder:
-    """Playwright browser holder."""
+# def handle_sigint(_signum: int, _frame: FrameType) -> None:
+#    """Custom signal handler for SIGINT.
+#
+#    Args:
+#        _signum (int): Signal number.
+#        _frame (FrameType): Current stack frame.
+#    """
+#    if isinstance(browser, Browser):
+#        browser.close()
+#    print("\nCaught SIGINT (Ctrl+C). Cleaning up...")
+#    # do cleanup code here
+#    sys.exit(0)  # or raise KeyboardInterrupt()
+import threading
 
-    browser: Browser | None = None
+stop = threading.Event()
 
-    # def __init__(self) -> None:
-    #    """Initialize the browser holder."""
-    #    self.browser = None
+
+def sig_handler(
+    _signum: int,
+    _frame: FrameType | None,
+    *,
+    browser: Browser | None,
+    page: Page | None,
+) -> None:
+    """Custom signal handler for SIGINT.
+
+    Args:
+        _signum (int): Signal number.
+        _frame (FrameType): Current stack frame.
+        browser (Browser): Holds the browser instance.
+    """
+    print("\nSIGINT received")
+    # if isinstance(page, Page):
+    #    print("\nSIGINT received — closing page…")
+    #    page.close()
+    # if isinstance(browser, Browser):
+    #    print("\nSIGINT received — closing browser")
+    #    browser.close()
+
+    # stop.set()
+    raise SystemExit(130)
+
+    # sys.exit(130)
+
+
+def install_signal_handlers(
+    browser: Browser | None,
+    page: Page | None,
+) -> Callable[[int, FrameType | None], None]:
+    """
+    Install signal handlers for SIGINT and SIGTERM.
+
+    Args:
+        browser (Browser): Holds the browser instance.
+        page (Page): Holds the page instance.
+    """
+
+    def handler(_signum: int, _frame: FrameType | None) -> None:
+        stop.set()
+        signal.default_int_handler(_signum, _frame)
+
+    _ = signal.signal(signal.SIGINT, handler)
+    with contextlib.suppress(AttributeError):
+        _ = signal.signal(signal.SIGTERM, handler)
+    return handler  # handy for yaspin.sigmap
+
+    # sig_handler(_signum, _frame, browser=browser, page=page)
+    # Always available
+    # _ = signal.signal(signal.SIGINT, handler)
+    # On platforms where SIGTERM doesn't exist (Windows)
+    # with contextlib.suppress(AttributeError):
+    #    _ = signal.signal(signal.SIGTERM, handler)
+    # return handler
 
 
 def main() -> None:
     """Main entry point of the program."""
     # Configure global logger instance
     setup_logging(os.getenv("LOG_LEVEL", ""))
+    browser: Browser | None = None
+    page: Page | None = None
+    _ = install_signal_handlers(browser, page)
 
     try:
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -1214,16 +1278,14 @@ def main() -> None:
     url = build_url(areas_parsed)
     logger.debug("scraping url '%s' with playwright", url)
 
-    browser = BrowserHolder()
-
     # Initialize spinner with sigmap including browser
     sp = yaspin(
         text=f"{SPINNER_TEXT}, scraping page 1",
         side="right",
         sigmap={
             signal.SIGINT: functools.partial(
-                sig_handler,
-                browser_holder=browser,
+                sig_handler_yaspin,
+                browser=browser,
             ),
         },
     )
@@ -1233,12 +1295,12 @@ def main() -> None:
         # Launch browser
         browser = ctx.chromium.launch(headless=True)
 
-        # if is_logging_enabled():
-        #    print(
-        #        f"{SPINNER_TEXT}, scraping page 1",
-        #    )
-        # else:
-        sp.start()
+        if is_logging_enabled():
+            print(
+                f"{SPINNER_TEXT}, scraping page 1",
+            )
+        else:
+            sp.start()
 
         # Variables for parking spaces
         parking_all: list[Parking] = []
@@ -1246,12 +1308,24 @@ def main() -> None:
 
         # Create a new page, navigate to url and dismiss cookie banner
         page = browser.new_page()
-        page_load(browser, page, url)
-        dismiss_cookie_banner(browser, page)
+        try:
+            while not stop.is_set():
+                page_load(browser, page, url)
+                dismiss_cookie_banner(browser, page)
 
-        page_scrape(browser, page, sp, parking_all)
-        parking_changes = compare_parkings(parking_previous, parking_all)
-
+                page_scrape(browser, page, sp, parking_all)
+                parking_changes = compare_parkings(parking_previous, parking_all)
+        except KeyboardInterrupt:
+            return 130
+        finally:
+            print("closing")
+            # Close quietly, in order; ignore harmless races
+            with contextlib.suppress(PlaywrightError):
+                if page and not page.is_closed():
+                    page.close()
+            with contextlib.suppress(PlaywrightError):
+                if browser and browser.is_connected():
+                    browser.close()
     # Save the current state
     parking_state_save(parking_all)
 
