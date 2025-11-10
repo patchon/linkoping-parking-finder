@@ -7,11 +7,15 @@ from __future__ import annotations
 
 import contextlib
 from enum import StrEnum
+
+# Setup browser context
+import functools
 import json
 import logging
 import os
 import pathlib
 import re
+import signal
 import sys
 import time
 from typing import TYPE_CHECKING, ClassVar, Never
@@ -31,11 +35,54 @@ from twilio.base.exceptions import TwilioRestException
 from twilio.rest import Client
 from yaspin import yaspin
 
+from parking_finder.parking_logger import setup_logging
+
 if TYPE_CHECKING:
+    from types import FrameType
+
+    from playwright.sync_api import Page
+    from twilio.rest.api.v2010.account.message import MessageInstance, MessageList
     from yaspin.core import Yaspin
 
-STATE_FILE_NAME = ".parking_state.json"
-STATE_FILE_PATH = pathlib.Path(STATE_FILE_NAME)
+
+# Labels for the parking spot information.
+class ParkingLabel(StrEnum):
+    """Labels representing a parking spot."""
+
+    access = "Tillträde:"
+    address = "Adress:"
+    area = "Område:"
+    interest = "Antal intresse:"
+    rent = "Hyra:"
+    kind = "Type:"
+
+
+# Attributes for the parking spot information.
+# We use this model to represent a parkin spot.
+class Parking(BaseModel):
+    """Attributes representing a parking spot.
+
+    Attributes:
+        access (str): The date of access.
+        address (str): The address of the parking spot.
+        area (str): The area where the parking spot is located.
+        interest (str): The number of interested parties.
+        rent (str): The rental price.
+        kind (str): The type of parking spot.
+    """
+
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid")
+    access: StrictStr
+    address: StrictStr
+    area: StrictStr
+    interest: StrictStr
+    rent: StrictStr
+    kind: StrictStr
+
+
+CACHE_DIR = pathlib.Path.home() / ".cache" / "parking_finder"
+STATE_FILE_NAME = ".parking_finder-cache.json"
+STATE_FILE_PATH = CACHE_DIR / STATE_FILE_NAME
 
 # Area codes and their display names
 AREA_MAP = {
@@ -81,39 +128,6 @@ EMOJI_MAP: dict[str, str] = {
 }
 
 
-# Labels for the parking spot information
-class ParkingLabel(StrEnum):
-    """Labels representing a parking spot."""
-
-    access = "Tillträde:"
-    address = "Adress:"
-    area = "Område:"
-    interest = "Antal intresse:"
-    rent = "Hyra:"
-    kind = "Type:"
-
-
-class Parking(BaseModel):
-    """Attributes representing a parking spot.
-
-    Attributes:
-        access (str): The date of access.
-        address (str): The address of the parking spot.
-        area (str): The area where the parking spot is located.
-        interest (str): The number of interested parties.
-        rent (str): The rental price.
-        kind (str): The type of parking spot.
-    """
-
-    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid")
-    access: StrictStr
-    address: StrictStr
-    area: StrictStr
-    interest: StrictStr
-    rent: StrictStr
-    kind: StrictStr
-
-
 # Base URL for the website
 BASE_URL = "https://www.stangastaden.se/sokledigt/bilplats/"
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "")
@@ -124,38 +138,6 @@ SPINNER_TEXT = "Hang tight while we fetch parking spaces from Stångåstaden"
 
 # Create global logger instance
 logger = logging.getLogger(__name__)
-
-
-def setup_logging(level: str) -> None:
-    """Configure the logger.
-
-    Sets up logging to stderr with a custom formatter. Applies the log level
-    globally using ``logging.basicConfig``. Subsequent calls have no effect
-    if logging is already configured.
-
-    Args:
-        level (str): The log level to set. Defaults to "INFO".
-    """
-    # Skip reconfiguration if handlers already exist
-    if logging.getLogger().handlers:
-        return
-
-    # Set log level.
-    log_level = getattr(logging, level.upper(), logging.ERROR)
-
-    # Set formatter
-    formatter = logging.Formatter(
-        "%(asctime)s %(levelname)-8s %(message)s",
-        datefmt="%Y-%m-%dT%H:%M:%S",
-    )
-
-    # Stream logs to stderr and set formatter
-    handler = logging.StreamHandler(sys.stderr)
-    handler.setFormatter(formatter)
-
-    # Configure logging and output log level
-    logging.basicConfig(level=log_level, handlers=[handler])
-    logger.debug("setting log level to %s", logging.getLevelName(log_level))
 
 
 def validate_and_display_areas(input_args: list[str]) -> list[str]:
@@ -628,16 +610,17 @@ def notify_whatsapp(message: str) -> None:
     logger.info("sending whatsapp notification")
     try:
         client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-        message_instance = client.messages.create(
+        messages: MessageList = client.messages  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
+        message_instance: MessageInstance = messages.create(  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
             body=message,
             from_=WHATSAPP_FROM,
             to=WHATSAPP_TO,
         )
-        if message_instance.status in ["queued", "sending", "sent", "delivered"]:
+        if message_instance.status in ["queued", "sending", "sent", "delivered"]:  # pyright: ignore[reportUnknownMemberType]
             logger.debug(
                 "whatsapp notification sent successfully, message sid: %s, status: %s",
-                message_instance.sid,
-                message_instance.status,
+                message_instance.sid,  # pyright: ignore[reportUnknownArgumentType, reportUnknownMemberType]
+                message_instance.status,  # pyright: ignore[reportUnknownArgumentType, reportUnknownMemberType]
             )
         else:
             logger.error(
@@ -645,10 +628,10 @@ def notify_whatsapp(message: str) -> None:
                     "whatsapp notification failed, message sid: %s, status: %s, error"
                     "code '%s', error message '%s'"
                 ),
-                message_instance.sid,
-                message_instance.status,
-                message_instance.error_code,
-                message_instance.error_message,
+                message_instance.sid,  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType]
+                message_instance.status,  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType]
+                message_instance.error_code,  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType]
+                message_instance.error_message,  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType]
             )
     except TwilioRestException:
         logger.exception("failure when sending whatsapp notification: ")
@@ -688,11 +671,18 @@ def page_scrape(
         pagination_links = page.query_selector_all("span.PaginationList.PageLink")
 
         if curr_page > 1:
-            sp.text = (
-                f"{SPINNER_TEXT}, scraping page {curr_page} / "
-                f"{len(pagination_links)}"
-                f" (a total of {len(parking_all)} parkingspace(s) found)"
-            )
+            if is_logging_enabled():
+                print(
+                    f"{SPINNER_TEXT}, scraping page {curr_page} / ",
+                    f"{len(pagination_links)}",
+                    f" (a total of {len(parking_all)} parkingspace(s) found)",
+                )
+            else:
+                sp.text = (
+                    f"{SPINNER_TEXT}, scraping page {curr_page} / "
+                    f"{len(pagination_links)}"
+                    f" (a total of {len(parking_all)} parkingspace(s) found)"
+                )
 
         # No pagination links at all
         if not pagination_links:
@@ -1146,10 +1136,64 @@ def print_results(parking_all: list[Parking]) -> None:
         logger.info("no parking spots to display in table format")
 
 
+def is_logging_enabled() -> bool:
+    """Check if logging is enabled.
+
+    Returns:
+        bool: True if logging is enabled, False otherwise.
+
+    """
+    return logging.getLogger().isEnabledFor(logging.CRITICAL)
+
+
+# class BrowserHolder:
+#    browser: Browser | None = None
+
+
+def sig_handler(
+    _signum: int,
+    _frame: FrameType,
+    spinner: Yaspin,
+    browser_holder: BrowserHolder,
+) -> None:
+    """Custom signal handler for SIGINT.
+
+    Args:
+        _signum (int): Signal number.
+        _frame (FrameType): Current stack frame.
+        spinner (Yaspin): Spinner instance.
+        browser_holder (BrowserHolder): Holds the browser instance.
+    """
+    if isinstance(browser_holder.browser, Browser):
+        browser_holder.browser.close()
+    spinner.red.fail("-> received SIGINT ")
+    spinner.stop()
+    sys.exit(1)
+
+
+class BrowserHolder:
+    """Playwright browser holder."""
+
+    browser: Browser | None = None
+
+    # def __init__(self) -> None:
+    #    """Initialize the browser holder."""
+    #    self.browser = None
+
+
 def main() -> None:
     """Main entry point of the program."""
     # Configure global logger instance
-    setup_logging(os.getenv("LOG_LEVEL", "").upper())
+    setup_logging(os.getenv("LOG_LEVEL", ""))
+
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        logger.exception(
+            "failed to create cache directory '%s', check permissions or disk space",
+            CACHE_DIR,
+        )
+        exit_with_status(1)
 
     parking_previous = parking_state_load()
 
@@ -1170,20 +1214,35 @@ def main() -> None:
     url = build_url(areas_parsed)
     logger.debug("scraping url '%s' with playwright", url)
 
-    # Initialize spinner
-    sp = yaspin()
-    sp.side = "right"
-    sp.text = f"{SPINNER_TEXT}, scraping page 1"
-    sp.start()
+    browser = BrowserHolder()
 
-    # Variables for parking spaces
-    parking_all: list[Parking] = []
-    parking_changes: dict[str, list[Parking]] = {"added": [], "removed": []}
+    # Initialize spinner with sigmap including browser
+    sp = yaspin(
+        text=f"{SPINNER_TEXT}, scraping page 1",
+        side="right",
+        sigmap={
+            signal.SIGINT: functools.partial(
+                sig_handler,
+                browser_holder=browser,
+            ),
+        },
+    )
 
     # Setup browser context
     with sync_playwright() as ctx:
         # Launch browser
         browser = ctx.chromium.launch(headless=True)
+
+        # if is_logging_enabled():
+        #    print(
+        #        f"{SPINNER_TEXT}, scraping page 1",
+        #    )
+        # else:
+        sp.start()
+
+        # Variables for parking spaces
+        parking_all: list[Parking] = []
+        parking_changes: dict[str, list[Parking]] = {"added": [], "removed": []}
 
         # Create a new page, navigate to url and dismiss cookie banner
         page = browser.new_page()
